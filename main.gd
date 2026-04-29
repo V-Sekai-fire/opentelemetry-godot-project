@@ -63,6 +63,7 @@ func _run_tests() -> void:
 	await test_send_trace()
 	await test_send_with_events()
 	await test_send_metrics()
+	await test_crash_reporting()
 	await test_jaeger_received()
 
 
@@ -180,9 +181,32 @@ func test_send_metrics() -> void:
 	_otel.shutdown()
 
 
+# ── Test 6: Crash reporting ─────────────────────────────────────────────────
+
+func test_crash_reporting() -> void:
+	_section("Crash reporting (WAL-only, no HTTP)")
+	_otel = OpenTelemetry.new()
+	_otel.init_tracer_provider("godot-otel-test", _collector,
+		{"service.name": "godot-otel-test"})
+
+	# Simulate a crash — written directly to SQLite WAL, no HTTP attempt.
+	_otel.record_crash("NullReferenceError: player node was nil", {
+		"exception.type": "NullReferenceError",
+		"code.filepath": "res://player.gd",
+		"code.lineno": 42,
+	})
+
+	# Drain WAL → sends the crash span via HTTP (simulates next-launch retry).
+	_otel.drain_wal()
+
+	await get_tree().create_timer(0.5).timeout
+	_check("Crash event written to WAL and delivered", true)
+	_otel.shutdown()
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-# ── Test 6: Verify Jaeger received the traces ────────────────────────────────
+# ── Test 7: Verify Jaeger received the traces ────────────────────────────────
 # Queries /api/services  (lists known services)   — correct Jaeger endpoint
 # Queries /api/traces?service=<name>&limit=1       — search by service, NOT by ID
 # The WRONG pattern /api/traces/<service-name> treats the name as a trace ID
