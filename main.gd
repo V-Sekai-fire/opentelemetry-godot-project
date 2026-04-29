@@ -1,8 +1,8 @@
 extends Node
-## OpenTelemetry collector connectivity test.
+## OpenTelemetry OTLP compliance test.
 ##
-## Sends a trace with two spans to a standard OTLP/HTTP collector
-## (default: http://localhost:4318) and reports pass/fail.
+## Verifies the C++ module produces wire-correct OTLP/HTTP JSON and that
+## Jaeger receives and indexes traces with the right structure.
 ##
 ## Run with:
 ##   godot.macos.editor.dev.double.arm64 --headless --path . -- --collector http://localhost:4318
@@ -26,7 +26,7 @@ func _ready() -> void:
 	_collector = _parse_collector_arg()
 	_jaeger    = _parse_jaeger_arg()
 	print("=" .repeat(60))
-	print("OpenTelemetry collector connectivity test")
+	print("OpenTelemetry OTLP compliance test")
 	print("Collector: %s" % _collector)
 	print("Jaeger:    %s" % _jaeger)
 	print("=" .repeat(60))
@@ -58,7 +58,8 @@ func _parse_jaeger_arg() -> String:
 
 
 func _run_tests() -> void:
-	await test_id_generation()
+	await test_id_format()
+	await test_span_kind_enum()
 	await test_console_sink()
 	await test_send_trace()
 	await test_send_with_events()
@@ -67,22 +68,37 @@ func _run_tests() -> void:
 	await test_jaeger_received()
 
 
-# ── Test 1: ID generation ────────────────────────────────────────────────────
+# ── Test 1: OTLP ID format (spec §traceId/spanId must be 32/16 hex chars) ────
 
-func test_id_generation() -> void:
-	_section("ID generation")
-	_otel = OpenTelemetry.new()
-	_otel.init_tracer_provider("id-test", "console", {})
+func test_id_format() -> void:
+	_section("OTLP ID format (spec: traceId=32 hex, spanId=16 hex)")
 
-	var span_id := _otel.start_span("id_check")
-	_otel.end_span(span_id)
+	var trace_id := OTelSpan.generate_trace_id()
+	var span_id  := OTelSpan.generate_span_id()
 
-	_check("span_id is not empty", not span_id.is_empty())
-	_check("span_id is a valid UUID-ish string (length > 8)", span_id.length() > 8)
-	_otel.shutdown()
+	_check("traceId length == 32",  trace_id.length() == 32)
+	_check("spanId  length == 16",  span_id.length()  == 16)
+	_check("traceId is lowercase hex", _is_hex(trace_id))
+	_check("spanId  is lowercase hex", _is_hex(span_id))
+	_check("traceId is non-zero",   trace_id != "0".repeat(32))
+	_check("spanId  is non-zero",   span_id  != "0".repeat(16))
 
 
-# ── Test 2: Console sink (no network) ───────────────────────────────────────
+# ── Test 2: SpanKind enum matches OTLP proto values ──────────────────────────
+# Spec: UNSPECIFIED=0, INTERNAL=1, SERVER=2, CLIENT=3, PRODUCER=4, CONSUMER=5
+
+func test_span_kind_enum() -> void:
+	_section("SpanKind enum values (spec: INTERNAL=1, SERVER=2, CLIENT=3)")
+
+	_check("SPAN_KIND_UNSPECIFIED == 0", OpenTelemetry.SPAN_KIND_UNSPECIFIED == 0)
+	_check("SPAN_KIND_INTERNAL    == 1", OpenTelemetry.SPAN_KIND_INTERNAL    == 1)
+	_check("SPAN_KIND_SERVER      == 2", OpenTelemetry.SPAN_KIND_SERVER      == 2)
+	_check("SPAN_KIND_CLIENT      == 3", OpenTelemetry.SPAN_KIND_CLIENT      == 3)
+	_check("SPAN_KIND_PRODUCER    == 4", OpenTelemetry.SPAN_KIND_PRODUCER    == 4)
+	_check("SPAN_KIND_CONSUMER    == 5", OpenTelemetry.SPAN_KIND_CONSUMER    == 5)
+
+
+# ── Test 3: Console sink (no network) ───────────────────────────────────────
 
 func test_console_sink() -> void:
 	_section("Console sink (no network)")
@@ -92,7 +108,7 @@ func test_console_sink() -> void:
 	var root := _otel.start_span("root_operation", OpenTelemetry.SPAN_KIND_SERVER)
 	_otel.add_event(root, "test.started", {"iteration": 1})
 	_otel.set_attributes(root, {"http.method": "GET", "http.status_code": 200})
-	var child := _otel.start_span_with_parent("child_operation", root)
+	var child := _otel.start_span_with_parent("child_operation", root, OpenTelemetry.SPAN_KIND_CLIENT)
 	_otel.end_span(child)
 	_otel.set_status(root, OpenTelemetry.STATUS_OK)
 	_otel.end_span(root)
@@ -102,7 +118,9 @@ func test_console_sink() -> void:
 	_otel.shutdown()
 
 
-# ── Test 3: Send a trace to the collector ────────────────────────────────────
+# ── Test 4: Send a trace to the collector ────────────────────────────────────
+# Uses SPAN_KIND_SERVER (=2) and SPAN_KIND_CLIENT (=3) per OTLP spec.
+# Integer attribute http.status_code=200 tests intValue decimal-string encoding.
 
 func test_send_trace() -> void:
 	_section("Send trace to collector (%s)" % _collector)
@@ -130,13 +148,12 @@ func test_send_trace() -> void:
 	_otel.end_span(root)
 	_otel.flush_all()
 
-	# Give the HTTP request a moment to complete
 	await get_tree().create_timer(0.5).timeout
 	_check("Trace sent without crash", true)
 	_otel.shutdown()
 
 
-# ── Test 4: Span with events ─────────────────────────────────────────────────
+# ── Test 5: Span with events ─────────────────────────────────────────────────
 
 func test_send_with_events() -> void:
 	_section("Span with events and exception")
@@ -157,7 +174,7 @@ func test_send_with_events() -> void:
 	_otel.shutdown()
 
 
-# ── Test 5: Metrics ──────────────────────────────────────────────────────────
+# ── Test 6: Metrics ──────────────────────────────────────────────────────────
 
 func test_send_metrics() -> void:
 	_section("Metrics")
@@ -167,12 +184,12 @@ func test_send_metrics() -> void:
 
 	var counter := _otel.create_counter("requests.total", "1", "Total HTTP requests")
 	var latency := _otel.create_histogram("request.duration", "ms", "Request latency")
-	var active := _otel.create_gauge("connections.active", "1", "Active connections")
+	var active  := _otel.create_gauge("connections.active", "1", "Active connections")
 
 	_otel.increment_counter(counter, 1.0, {"method": "GET", "status": "200"})
 	_otel.increment_counter(counter, 3.0, {"method": "POST", "status": "201"})
 	_otel.record_histogram(latency, 12.5, {"endpoint": "/api/data"})
-	_otel.record_histogram(latency, 8.3, {"endpoint": "/api/health"})
+	_otel.record_histogram(latency, 8.3,  {"endpoint": "/api/health"})
 	_otel.set_gauge(active, 7.0, {})
 	_otel.flush_all()
 
@@ -181,7 +198,7 @@ func test_send_metrics() -> void:
 	_otel.shutdown()
 
 
-# ── Test 6: Crash reporting ─────────────────────────────────────────────────
+# ── Test 7: Crash reporting ──────────────────────────────────────────────────
 
 func test_crash_reporting() -> void:
 	_section("Crash reporting (WAL-only, no HTTP)")
@@ -189,14 +206,11 @@ func test_crash_reporting() -> void:
 	_otel.init_tracer_provider("godot-otel-test", _collector,
 		{"service.name": "godot-otel-test"})
 
-	# Simulate a crash — written directly to SQLite WAL, no HTTP attempt.
 	_otel.record_crash("NullReferenceError: player node was nil", {
 		"exception.type": "NullReferenceError",
 		"code.filepath": "res://player.gd",
 		"code.lineno": 42,
 	})
-
-	# Drain WAL → sends the crash span via HTTP (simulates next-launch retry).
 	_otel.drain_wal()
 
 	await get_tree().create_timer(0.5).timeout
@@ -204,18 +218,18 @@ func test_crash_reporting() -> void:
 	_otel.shutdown()
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
-# ── Test 7: Verify Jaeger received the traces ────────────────────────────────
-# Queries /api/services  (lists known services)   — correct Jaeger endpoint
-# Queries /api/traces?service=<name>&limit=1       — search by service, NOT by ID
-# The WRONG pattern /api/traces/<service-name> treats the name as a trace ID
-# and returns 400 "strconv.ParseUint: invalid syntax".
+# ── Test 8: Jaeger end-to-end + spec field verification ──────────────────────
+# Queries Jaeger to confirm:
+#   - service registered
+#   - traces present
+#   - http.request span has span.kind=server (OTLP SERVER=2 → Jaeger "server")
+#   - db.query span has span.kind=client  (OTLP CLIENT=3 → Jaeger "client")
+#   - db.query has a parent reference (parentSpanId wired correctly)
+#   - http.status_code=200 tag present (intValue decimal-string round-trip)
 
 func test_jaeger_received() -> void:
-	_section("Jaeger trace verification (%s)" % _jaeger)
+	_section("Jaeger end-to-end + OTLP field verification (%s)" % _jaeger)
 
-	# Parse host and port from the jaeger URL
 	var jaeger_host := _jaeger
 	var jaeger_port := 16686
 	if "://" in jaeger_host:
@@ -225,37 +239,97 @@ func test_jaeger_received() -> void:
 		jaeger_host = parts[0]
 		jaeger_port = int(parts[1])
 
-	var http := HTTPClient.new()
-	var err := http.connect_to_host(jaeger_host, jaeger_port)
-	if err != OK:
+	# ── helper: GET a Jaeger API path, return parsed JSON or null ────────────
+	var body: Variant = await _jaeger_get(jaeger_host, jaeger_port, "/api/services")
+	if body == null:
 		_check("Jaeger reachable", false)
 		return
+	_check("Jaeger reachable", true)
 
-	# Wait for connection
+	var parsed: Variant = JSON.parse_string(body)
+	if parsed and (parsed as Dictionary).has("data"):
+		_check("godot-otel-test registered in Jaeger",
+			"godot-otel-test" in ((parsed as Dictionary)["data"] as Array))
+	else:
+		_check("godot-otel-test registered in Jaeger", false)
+		return
+
+	# ── Fetch most recent http.request trace ─────────────────────────────────
+	var traces_body: Variant = await _jaeger_get(jaeger_host, jaeger_port,
+		"/api/traces?service=godot-otel-test&operation=http.request&limit=1")
+	if traces_body == null:
+		_check("Trace query returned data", false)
+		return
+
+	var tparsed: Variant = JSON.parse_string(traces_body as String)
+	if not (tparsed and tparsed.has("data") and (tparsed["data"] as Array).size() > 0):
+		_check("At least one http.request trace in Jaeger", false)
+		return
+	_check("At least one http.request trace in Jaeger", true)
+
+	var trace: Dictionary = (tparsed["data"] as Array)[0]
+	var spans: Array = trace.get("spans", [])
+	_check("Trace has 2 spans (root + child)", spans.size() == 2)
+
+	# ── Find spans by operation name ─────────────────────────────────────────
+	var root_span: Dictionary
+	var child_span: Dictionary
+	for s in spans:
+		if s.get("operationName", "") == "http.request":
+			root_span = s
+		elif s.get("operationName", "") == "db.query":
+			child_span = s
+
+	_check("http.request span found", not root_span.is_empty())
+	_check("db.query span found",     not child_span.is_empty())
+
+	if root_span.is_empty() or child_span.is_empty():
+		return
+
+	# ── Spec: span.kind tag reflects OTLP SpanKind wire value ────────────────
+	_check("http.request span.kind == server",
+		_jaeger_tag(root_span,  "span.kind") == "server")
+	_check("db.query span.kind == client",
+		_jaeger_tag(child_span, "span.kind") == "client")
+
+	# ── Spec: parentSpanId wired on child (traceId propagated) ───────────────
+	var refs: Array = child_span.get("references", [])
+	var has_parent := false
+	for r in refs:
+		if r.get("refType", "") == "CHILD_OF":
+			has_parent = true
+	_check("db.query has CHILD_OF parent reference", has_parent)
+
+	# ── Spec: integer attribute http.status_code round-trips correctly ────────
+	_check("http.request has http.status_code tag",
+		_jaeger_tag(root_span, "http.status_code") != null)
+
+	# ── Spec: traceId is 32 lowercase hex chars ───────────────────────────────
+	var wire_trace_id: String = trace.get("traceID", "")
+	_check("traceID is 32 hex chars", wire_trace_id.length() == 32)
+	_check("traceID is lowercase hex", _is_hex(wire_trace_id))
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+func _jaeger_get(p_host: String, p_port: int, p_path: String) -> Variant:
+	var http := HTTPClient.new()
+	if http.connect_to_host(p_host, p_port) != OK:
+		return null
 	for _i in 20:
 		http.poll()
 		if http.get_status() == HTTPClient.STATUS_CONNECTED:
 			break
 		await get_tree().create_timer(0.1).timeout
-
 	if http.get_status() != HTTPClient.STATUS_CONNECTED:
-		_check("Jaeger reachable", false)
-		return
-
-	_check("Jaeger reachable", true)
-
-	# /api/services — confirms the collector is forwarding
-	err = http.request(HTTPClient.METHOD_GET, "/api/services", [])
-	if err != OK:
-		_check("Jaeger /api/services request sent", false)
-		return
-
+		return null
+	if http.request(HTTPClient.METHOD_GET, p_path, []) != OK:
+		return null
 	for _i in 50:
 		http.poll()
 		if http.get_status() == HTTPClient.STATUS_BODY:
 			break
 		await get_tree().create_timer(0.1).timeout
-
 	var body := PackedByteArray()
 	while http.get_status() == HTTPClient.STATUS_BODY:
 		http.poll()
@@ -263,55 +337,23 @@ func test_jaeger_received() -> void:
 		if chunk.size() > 0:
 			body.append_array(chunk)
 		await get_tree().create_timer(0.01).timeout
-
-	var services_json := body.get_string_from_utf8()
-	_check("Jaeger /api/services returned data", services_json.length() > 0)
-
-	var parsed: Variant = JSON.parse_string(services_json)
-	if parsed and parsed.has("data"):
-		var services: Array = parsed["data"]
-		_check("godot-otel-test registered in Jaeger", "godot-otel-test" in services)
-	else:
-		_check("godot-otel-test registered in Jaeger", false)
-
-	# /api/traces?service=godot-otel-test&limit=1 — fresh connection for second request
 	http.close()
-	var http2 := HTTPClient.new()
-	err = http2.connect_to_host(jaeger_host, jaeger_port)
-	if err != OK:
-		_check("At least one trace in Jaeger for godot-otel-test", false)
-		return
-	for _i in 20:
-		http2.poll()
-		if http2.get_status() == HTTPClient.STATUS_CONNECTED:
-			break
-		await get_tree().create_timer(0.1).timeout
-	if http2.get_status() != HTTPClient.STATUS_CONNECTED:
-		_check("At least one trace in Jaeger for godot-otel-test", false)
-		return
-	err = http2.request(HTTPClient.METHOD_GET, "/api/traces?service=godot-otel-test&limit=1", [])
-	if err != OK:
-		_check("At least one trace in Jaeger for godot-otel-test", false)
-		return
-	for _i in 50:
-		http2.poll()
-		if http2.get_status() == HTTPClient.STATUS_BODY:
-			break
-		await get_tree().create_timer(0.1).timeout
-	body = PackedByteArray()
-	while http2.get_status() == HTTPClient.STATUS_BODY:
-		http2.poll()
-		var chunk := http2.read_response_body_chunk()
-		if chunk.size() > 0:
-			body.append_array(chunk)
-		await get_tree().create_timer(0.01).timeout
-	var tparsed: Variant = JSON.parse_string(body.get_string_from_utf8())
-	if tparsed and tparsed.has("data"):
-		var traces: Array = tparsed["data"]
-		_check("At least one trace in Jaeger for godot-otel-test", traces.size() > 0)
-	else:
-		_check("At least one trace in Jaeger for godot-otel-test", false)
-	http2.close()
+	return body.get_string_from_utf8()
+
+
+func _jaeger_tag(p_span: Dictionary, p_key: String) -> Variant:
+	for tag in p_span.get("tags", []):
+		if tag.get("key", "") == p_key:
+			return tag.get("value", null)
+	return null
+
+
+func _is_hex(p_str: String) -> bool:
+	for i in p_str.length():
+		var c := p_str[i]
+		if not ((c >= "0" and c <= "9") or (c >= "a" and c <= "f")):
+			return false
+	return p_str.length() > 0
 
 
 func _section(name: String) -> void:
