@@ -13,18 +13,22 @@ extends Node
 ## Verify in Jaeger UI: http://localhost:16686
 
 const DEFAULT_COLLECTOR := "http://localhost:4318"
+const DEFAULT_JAEGER    := "http://localhost:16686"
 
 var _otel: OpenTelemetry
 var _collector: String
+var _jaeger: String
 var _passed := 0
 var _failed := 0
 
 
 func _ready() -> void:
 	_collector = _parse_collector_arg()
+	_jaeger    = _parse_jaeger_arg()
 	print("=" .repeat(60))
 	print("OpenTelemetry collector connectivity test")
 	print("Collector: %s" % _collector)
+	print("Jaeger:    %s" % _jaeger)
 	print("=" .repeat(60))
 
 	await _run_tests()
@@ -45,12 +49,22 @@ func _parse_collector_arg() -> String:
 	return DEFAULT_COLLECTOR
 
 
+func _parse_jaeger_arg() -> String:
+	var args := OS.get_cmdline_user_args()
+	for i in args.size():
+		if args[i] == "--jaeger" and i + 1 < args.size():
+			return args[i + 1]
+	return DEFAULT_JAEGER
+
+
 func _run_tests() -> void:
 	await test_id_generation()
 	await test_console_sink()
+	await test_collector_reachable()
 	await test_send_trace()
 	await test_send_with_events()
 	await test_send_metrics()
+	await test_jaeger_received()
 
 
 # ── Test 1: ID generation ────────────────────────────────────────────────────
@@ -86,6 +100,54 @@ func test_console_sink() -> void:
 
 	_check("Console sink: flush did not crash", true)
 	_otel.shutdown()
+
+
+# ── Helper: HTTP POST JSON ────────────────────────────────────────────────────
+
+func _http_post_json(p_url: String, p_body: String) -> int:
+	var url_parts := p_url.split("://", true, 1)
+	var host_path := url_parts[1] if url_parts.size() > 1 else p_url
+	var slash_pos := host_path.find("/")
+	var host_and_port := host_path.substr(0, slash_pos) if slash_pos != -1 else host_path
+	var path := host_path.substr(slash_pos) if slash_pos != -1 else "/"
+	var host := host_and_port
+	var port := 80
+	if ":" in host_and_port:
+		var hp := host_and_port.split(":")
+		host = hp[0]
+		port = int(hp[1])
+	var http := HTTPClient.new()
+	var err := http.connect_to_host(host, port)
+	if err != OK:
+		return -1
+	for _i in 50:
+		http.poll()
+		if http.get_status() == HTTPClient.STATUS_CONNECTED:
+			break
+		await get_tree().create_timer(0.05).timeout
+	if http.get_status() != HTTPClient.STATUS_CONNECTED:
+		return -2
+	var hdrs := PackedStringArray(["Content-Type: application/json"])
+	err = http.request(HTTPClient.METHOD_POST, path, hdrs, p_body)
+	if err != OK:
+		return -3
+	for _i in 50:
+		http.poll()
+		if http.get_status() == HTTPClient.STATUS_BODY or http.get_status() == HTTPClient.STATUS_CONNECTED:
+			break
+		await get_tree().create_timer(0.05).timeout
+	var response_code := http.get_response_code()
+	http.close()
+	return response_code
+
+
+# ── Test 2b: Collector reachable via raw HTTP ─────────────────────────────────
+
+func test_collector_reachable() -> void:
+	_section("Collector reachable via raw HTTP (%s)" % _collector)
+	var minimal_trace := '{"resourceSpans":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"godot-smoke"}}]},"scopeSpans":[{"scope":{"name":"smoke"},"spans":[{"traceId":"deadbeefdeadbeefdeadbeefdeadbeef","spanId":"deadbeefdeadbeef","name":"smoke-span","kind":1,"startTimeUnixNano":"1000000000000","endTimeUnixNano":"2000000000000","status":{"code":1}}]}]}]}'
+	var code := await _http_post_json(_collector + "/v1/traces", minimal_trace)
+	_check("Collector POST /v1/traces HTTP %d" % code, code == 200)
 
 
 # ── Test 3: Send a trace to the collector ────────────────────────────────────
@@ -168,6 +230,114 @@ func test_send_metrics() -> void:
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+# ── Test 6: Verify Jaeger received the traces ────────────────────────────────
+# Queries /api/services  (lists known services)   — correct Jaeger endpoint
+# Queries /api/traces?service=<name>&limit=1       — search by service, NOT by ID
+# The WRONG pattern /api/traces/<service-name> treats the name as a trace ID
+# and returns 400 "strconv.ParseUint: invalid syntax".
+
+func test_jaeger_received() -> void:
+	_section("Jaeger trace verification (%s)" % _jaeger)
+
+	# Parse host and port from the jaeger URL
+	var jaeger_host := _jaeger
+	var jaeger_port := 16686
+	if "://" in jaeger_host:
+		jaeger_host = jaeger_host.split("://")[1]
+	if ":" in jaeger_host:
+		var parts := jaeger_host.split(":")
+		jaeger_host = parts[0]
+		jaeger_port = int(parts[1])
+
+	var http := HTTPClient.new()
+	var err := http.connect_to_host(jaeger_host, jaeger_port)
+	if err != OK:
+		_check("Jaeger reachable", false)
+		return
+
+	# Wait for connection
+	for _i in 20:
+		http.poll()
+		if http.get_status() == HTTPClient.STATUS_CONNECTED:
+			break
+		await get_tree().create_timer(0.1).timeout
+
+	if http.get_status() != HTTPClient.STATUS_CONNECTED:
+		_check("Jaeger reachable", false)
+		return
+
+	_check("Jaeger reachable", true)
+
+	# /api/services — confirms the collector is forwarding
+	err = http.request(HTTPClient.METHOD_GET, "/api/services", [])
+	if err != OK:
+		_check("Jaeger /api/services request sent", false)
+		return
+
+	for _i in 50:
+		http.poll()
+		if http.get_status() == HTTPClient.STATUS_BODY:
+			break
+		await get_tree().create_timer(0.1).timeout
+
+	var body := PackedByteArray()
+	while http.get_status() == HTTPClient.STATUS_BODY:
+		http.poll()
+		var chunk := http.read_response_body_chunk()
+		if chunk.size() > 0:
+			body.append_array(chunk)
+		await get_tree().create_timer(0.01).timeout
+
+	var services_json := body.get_string_from_utf8()
+	_check("Jaeger /api/services returned data", services_json.length() > 0)
+
+	var parsed: Variant = JSON.parse_string(services_json)
+	if parsed and parsed.has("data"):
+		var services: Array = parsed["data"]
+		_check("godot-otel-test registered in Jaeger", "godot-otel-test" in services)
+	else:
+		_check("godot-otel-test registered in Jaeger", false)
+
+	# /api/traces?service=godot-otel-test&limit=1 — fresh connection for second request
+	http.close()
+	var http2 := HTTPClient.new()
+	err = http2.connect_to_host(jaeger_host, jaeger_port)
+	if err != OK:
+		_check("At least one trace in Jaeger for godot-otel-test", false)
+		return
+	for _i in 20:
+		http2.poll()
+		if http2.get_status() == HTTPClient.STATUS_CONNECTED:
+			break
+		await get_tree().create_timer(0.1).timeout
+	if http2.get_status() != HTTPClient.STATUS_CONNECTED:
+		_check("At least one trace in Jaeger for godot-otel-test", false)
+		return
+	err = http2.request(HTTPClient.METHOD_GET, "/api/traces?service=godot-otel-test&limit=1", [])
+	if err != OK:
+		_check("At least one trace in Jaeger for godot-otel-test", false)
+		return
+	for _i in 50:
+		http2.poll()
+		if http2.get_status() == HTTPClient.STATUS_BODY:
+			break
+		await get_tree().create_timer(0.1).timeout
+	body = PackedByteArray()
+	while http2.get_status() == HTTPClient.STATUS_BODY:
+		http2.poll()
+		var chunk := http2.read_response_body_chunk()
+		if chunk.size() > 0:
+			body.append_array(chunk)
+		await get_tree().create_timer(0.01).timeout
+	var tparsed: Variant = JSON.parse_string(body.get_string_from_utf8())
+	if tparsed and tparsed.has("data"):
+		var traces: Array = tparsed["data"]
+		_check("At least one trace in Jaeger for godot-otel-test", traces.size() > 0)
+	else:
+		_check("At least one trace in Jaeger for godot-otel-test", false)
+	http2.close()
+
 
 func _section(name: String) -> void:
 	print("\n── %s" % name)
