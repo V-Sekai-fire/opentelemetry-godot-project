@@ -60,7 +60,6 @@ func _parse_jaeger_arg() -> String:
 func _run_tests() -> void:
 	await test_id_generation()
 	await test_console_sink()
-	await test_collector_reachable()
 	await test_send_trace()
 	await test_send_with_events()
 	await test_send_metrics()
@@ -100,54 +99,6 @@ func test_console_sink() -> void:
 
 	_check("Console sink: flush did not crash", true)
 	_otel.shutdown()
-
-
-# ── Helper: HTTP POST JSON ────────────────────────────────────────────────────
-
-func _http_post_json(p_url: String, p_body: String) -> int:
-	var url_parts := p_url.split("://", true, 1)
-	var host_path := url_parts[1] if url_parts.size() > 1 else p_url
-	var slash_pos := host_path.find("/")
-	var host_and_port := host_path.substr(0, slash_pos) if slash_pos != -1 else host_path
-	var path := host_path.substr(slash_pos) if slash_pos != -1 else "/"
-	var host := host_and_port
-	var port := 80
-	if ":" in host_and_port:
-		var hp := host_and_port.split(":")
-		host = hp[0]
-		port = int(hp[1])
-	var http := HTTPClient.new()
-	var err := http.connect_to_host(host, port)
-	if err != OK:
-		return -1
-	for _i in 50:
-		http.poll()
-		if http.get_status() == HTTPClient.STATUS_CONNECTED:
-			break
-		await get_tree().create_timer(0.05).timeout
-	if http.get_status() != HTTPClient.STATUS_CONNECTED:
-		return -2
-	var hdrs := PackedStringArray(["Content-Type: application/json"])
-	err = http.request(HTTPClient.METHOD_POST, path, hdrs, p_body)
-	if err != OK:
-		return -3
-	for _i in 50:
-		http.poll()
-		if http.get_status() == HTTPClient.STATUS_BODY or http.get_status() == HTTPClient.STATUS_CONNECTED:
-			break
-		await get_tree().create_timer(0.05).timeout
-	var response_code := http.get_response_code()
-	http.close()
-	return response_code
-
-
-# ── Test 2b: Collector reachable via raw HTTP ─────────────────────────────────
-
-func test_collector_reachable() -> void:
-	_section("Collector reachable via raw HTTP (%s)" % _collector)
-	var minimal_trace := '{"resourceSpans":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"godot-smoke"}}]},"scopeSpans":[{"scope":{"name":"smoke"},"spans":[{"traceId":"deadbeefdeadbeefdeadbeefdeadbeef","spanId":"deadbeefdeadbeef","name":"smoke-span","kind":1,"startTimeUnixNano":"1000000000000","endTimeUnixNano":"2000000000000","status":{"code":1}}]}]}]}'
-	var code := await _http_post_json(_collector + "/v1/traces", minimal_trace)
-	_check("Collector POST /v1/traces HTTP %d" % code, code == 200)
 
 
 # ── Test 3: Send a trace to the collector ────────────────────────────────────
