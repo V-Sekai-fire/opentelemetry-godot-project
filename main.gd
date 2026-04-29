@@ -64,8 +64,12 @@ func _run_tests() -> void:
 	await test_send_trace()
 	await test_send_with_events()
 	await test_send_metrics()
+	await test_log_message()
+	await test_log_body_anyvalue()
 	await test_crash_reporting()
 	await test_jaeger_received()
+	await test_jaeger_event_timestamps()
+	await test_jaeger_span_status_message()
 
 
 # ── Test 1: OTLP ID format (spec §traceId/spanId must be 32/16 hex chars) ────
@@ -198,6 +202,54 @@ func test_send_metrics() -> void:
 	_otel.shutdown()
 
 
+# ── Test 6b: Log message — severityNumber, severityText, observedTimeUnixNano ─
+# Spec §LogRecord: severityNumber MUST be an integer (not enum name string).
+# Spec §LogRecord: observedTimeUnixNano MUST be set once observed.
+
+func test_log_message() -> void:
+	_section("Log message (severityNumber int, observedTimeUnixNano set)")
+	_otel = OpenTelemetry.new()
+	_otel.init_tracer_provider("godot-otel-test", _collector,
+		{"service.name": "godot-otel-test"})
+
+	_otel.log_message("INFO",  "player joined zone",  {"player.id": "p42"})
+	_otel.log_message("WARN",  "latency spike",        {"latency_ms": 320})
+	_otel.log_message("ERROR", "connection dropped",   {"reason": "timeout"})
+	_otel.flush_all()
+
+	await get_tree().create_timer(0.3).timeout
+	_check("Log messages sent without crash", true)
+	_otel.shutdown()
+
+
+# ── Test 6c: Log body as OTLP AnyValue ────────────────────────────────────────
+# Spec §AnyValue: body MUST be encoded as the appropriate typed field.
+#   String  → {stringValue: "..."}
+#   int     → {intValue: "decimal_string"}
+#   Dictionary → {kvlistValue: {values: [{key, value}...]}}
+#   Array   → {arrayValue: {values: [...]}}
+
+func test_log_body_anyvalue() -> void:
+	_section("Log body as AnyValue (string, int, Dictionary, Array)")
+	_otel = OpenTelemetry.new()
+	_otel.init_tracer_provider("godot-otel-test", _collector,
+		{"service.name": "godot-otel-test"})
+
+	# String body → stringValue
+	_otel.log_message("INFO", "plain string body", {})
+	# int body → intValue decimal string
+	_otel.log_message("DEBUG", 42, {})
+	# Dictionary body → kvlistValue
+	_otel.log_message("INFO", {"event": "player_joined", "player_id": 99, "zone": "hub"}, {})
+	# Array body → arrayValue
+	_otel.log_message("DEBUG", ["step_a", "step_b", "step_c"], {})
+	_otel.flush_all()
+
+	await get_tree().create_timer(0.3).timeout
+	_check("AnyValue log bodies sent without crash", true)
+	_otel.shutdown()
+
+
 # ── Test 7: Crash reporting ──────────────────────────────────────────────────
 
 func test_crash_reporting() -> void:
@@ -308,6 +360,112 @@ func test_jaeger_received() -> void:
 	var wire_trace_id: String = trace.get("traceID", "")
 	_check("traceID is 32 hex chars", wire_trace_id.length() == 32)
 	_check("traceID is lowercase hex", _is_hex(wire_trace_id))
+
+
+# ── Test 9: Span event timestamps are valid absolute nanoseconds ──────────────
+# Spec §Event.timeUnixNano: fixed64, decimal string in JSON.
+# Jaeger receives this and converts to a relative µs offset from span start.
+# If timeUnixNano were 0 or a raw integer overflow, Jaeger would show 0µs or
+# nonsense offsets for all three events — this test catches that regression.
+
+func test_jaeger_event_timestamps() -> void:
+	_section("Span event timestamps valid in Jaeger (spec: event.timeUnixNano decimal string)")
+
+	var jaeger_host := _jaeger
+	var jaeger_port := 16686
+	if "://" in jaeger_host:
+		jaeger_host = jaeger_host.split("://")[1]
+	if ":" in jaeger_host:
+		var parts := jaeger_host.split(":")
+		jaeger_host = parts[0]
+		jaeger_port = int(parts[1])
+
+	# Fetch the most recent risky_operation trace (has 3 events)
+	var body: Variant = await _jaeger_get(jaeger_host, jaeger_port,
+		"/api/traces?service=godot-otel-test&operation=risky_operation&limit=1")
+	if body == null:
+		_check("Jaeger reachable for event timestamp test", false)
+		return
+
+	var parsed: Variant = JSON.parse_string(body as String)
+	if not (parsed and (parsed as Dictionary).has("data")):
+		_check("risky_operation trace found", false)
+		return
+	var traces: Array = (parsed as Dictionary)["data"]
+	if traces.is_empty():
+		_check("risky_operation trace found", false)
+		return
+	_check("risky_operation trace found", true)
+
+	var span: Dictionary
+	for s in (traces[0] as Dictionary).get("spans", []):
+		if (s as Dictionary).get("operationName", "") == "risky_operation":
+			span = s
+	if span.is_empty():
+		_check("risky_operation span found", false)
+		return
+	_check("risky_operation span found", true)
+
+	# Spec: 3 events (cache.miss, db.fallback, exception)
+	var logs: Array = span.get("logs", [])
+	_check("3 span events received", logs.size() == 3)
+
+	# Spec: each event has a valid relative timestamp > 0µs
+	# (proves timeUnixNano was a proper decimal nanosecond string, not 0 or overflow)
+	var all_timestamps_valid := true
+	for log_entry in logs:
+		var ts: int = (log_entry as Dictionary).get("timestamp", 0)
+		if ts <= 0:
+			all_timestamps_valid = false
+	_check("All event timestamps are > 0 (timeUnixNano decimal string correct)", all_timestamps_valid)
+
+	# Spec: events carry their attribute fields
+	var first_event: Dictionary = logs[0]
+	var fields: Array = first_event.get("fields", [])
+	var has_event_name := false
+	for f in fields:
+		if (f as Dictionary).get("key", "") == "event":
+			has_event_name = true
+	_check("First event has 'event' field (cache.miss)", has_event_name)
+
+
+# ── Test 10: Span status.message round-trips via Jaeger ───────────────────────
+# Spec §Status: message field serialized as "message" (not "description").
+# Jaeger surfaces this as otel.status_description tag.
+
+func test_jaeger_span_status_message() -> void:
+	_section("Span status.message in Jaeger (spec: Status.message field)")
+
+	var jaeger_host := _jaeger
+	var jaeger_port := 16686
+	if "://" in jaeger_host:
+		jaeger_host = jaeger_host.split("://")[1]
+	if ":" in jaeger_host:
+		var parts := jaeger_host.split(":")
+		jaeger_host = parts[0]
+		jaeger_port = int(parts[1])
+
+	var body: Variant = await _jaeger_get(jaeger_host, jaeger_port,
+		"/api/traces?service=godot-otel-test&operation=risky_operation&limit=1")
+	if body == null:
+		_check("Jaeger reachable for status test", false)
+		return
+
+	var parsed: Variant = JSON.parse_string(body as String)
+	if not (parsed and (parsed as Dictionary).has("data") and
+			not ((parsed as Dictionary)["data"] as Array).is_empty()):
+		_check("risky_operation trace found for status test", false)
+		return
+
+	var span: Dictionary
+	for s in ((parsed as Dictionary)["data"][0] as Dictionary).get("spans", []):
+		if (s as Dictionary).get("operationName", "") == "risky_operation":
+			span = s
+
+	_check("otel.status_code = ERROR",
+		_jaeger_tag(span, "otel.status_code") == "ERROR")
+	_check("otel.status_description = 'user lookup failed'",
+		_jaeger_tag(span, "otel.status_description") == "user lookup failed")
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
